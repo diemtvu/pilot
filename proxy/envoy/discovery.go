@@ -15,12 +15,14 @@
 package envoy
 
 import (
+	"encoding/base64"
 	"encoding/json"
 	"fmt"
 	"net/http"
 	"net/http/pprof"
 	"sort"
 	"strconv"
+	"strings"
 	"sync"
 	"sync/atomic"
 
@@ -43,10 +45,13 @@ type DiscoveryService struct {
 	// considered with this change to avoid memory exhaustion as the
 	// entire cache will no longer be periodically flushed and stale
 	// entries can linger in the cache indefinitely.
-	sdsCache *discoveryCache
-	cdsCache *discoveryCache
-	rdsCache *discoveryCache
-	ldsCache *discoveryCache
+	sdsCache       *discoveryCache
+	cdsCache       *discoveryCache
+	rdsCache       *discoveryCache
+	ldsCache       *discoveryCache
+	hijackCdsCache *discoveryCache
+	hijackLdsCache *discoveryCache
+	hijackRdsCache *discoveryCache
 }
 
 type discoveryCacheStatEntry struct {
@@ -97,6 +102,7 @@ func (c *discoveryCache) cachedDiscoveryResponse(key string) ([]byte, bool) {
 
 func (c *discoveryCache) updateCachedDiscoveryResponse(key string, data []byte) {
 	if c.disabled {
+		glog.V(2).Infof("updateCachedDiscoveryResponse disable for %s\n", key)
 		return
 	}
 
@@ -112,6 +118,18 @@ func (c *discoveryCache) updateCachedDiscoveryResponse(key string, data []byte) 
 	}
 	entry.data = data
 	atomic.AddUint64(&entry.miss, 1)
+}
+
+func (c *discoveryCache) removeCachedDiscoveryResponse(key string) {
+	if c.disabled {
+		glog.V(2).Infof("removeCachedDiscoveryResponse disable for %s\n", key)
+		return
+	}
+
+	c.mu.Lock()
+	defer c.mu.Unlock()
+
+	delete(c.cache, key)
 }
 
 func (c *discoveryCache) clear() {
@@ -192,11 +210,14 @@ type DiscoveryServiceOptions struct {
 func NewDiscoveryService(ctl model.Controller, configCache model.ConfigStoreCache,
 	environment proxy.Environment, o DiscoveryServiceOptions) (*DiscoveryService, error) {
 	out := &DiscoveryService{
-		Environment: environment,
-		sdsCache:    newDiscoveryCache(o.EnableCaching),
-		cdsCache:    newDiscoveryCache(o.EnableCaching),
-		rdsCache:    newDiscoveryCache(o.EnableCaching),
-		ldsCache:    newDiscoveryCache(o.EnableCaching),
+		Environment:    environment,
+		sdsCache:       newDiscoveryCache(o.EnableCaching),
+		cdsCache:       newDiscoveryCache(o.EnableCaching),
+		rdsCache:       newDiscoveryCache(o.EnableCaching),
+		ldsCache:       newDiscoveryCache(o.EnableCaching),
+		hijackCdsCache: newDiscoveryCache(o.EnableCaching),
+		hijackLdsCache: newDiscoveryCache(o.EnableCaching),
+		hijackRdsCache: newDiscoveryCache(o.EnableCaching),
 	}
 	container := restful.NewContainer()
 	if o.EnableProfiling {
@@ -259,12 +280,40 @@ func (ds *DiscoveryService) Register(container *restful.Container) {
 		Param(ws.PathParameter(ServiceCluster, "client proxy service cluster").DataType("string")).
 		Param(ws.PathParameter(ServiceNode, "client proxy service node").DataType("string")))
 
+	ws.Route(ws.
+		GET(fmt.Sprintf("/v1/addclusters/{%s}/{%s}", ServiceCluster, ServiceNode)).
+		To(ds.AddClusters).
+		Doc("CDS inject cluster").
+		Param(ws.PathParameter(ServiceCluster, "client proxy service cluster").DataType("string")).
+		Param(ws.PathParameter(ServiceNode, "client proxy service node").DataType("string")))
+
+	ws.Route(ws.
+		GET(fmt.Sprintf("/v1/deleteclusters/{%s}/{%s}", ServiceCluster, ServiceNode)).
+		To(ds.DeleteClusters).
+		Doc("CDS delete cluster").
+		Param(ws.PathParameter(ServiceCluster, "client proxy service cluster").DataType("string")).
+		Param(ws.PathParameter(ServiceNode, "client proxy service node").DataType("string")))
+
 	// This route makes discovery act as an Envoy Route discovery service (RDS).
 	// See https://lyft.github.io/envoy/docs/configuration/http_conn_man/rds.html
 	ws.Route(ws.
 		GET(fmt.Sprintf("/v1/routes/{%s}/{%s}/{%s}", RouteConfigName, ServiceCluster, ServiceNode)).
 		To(ds.ListRoutes).
 		Doc("RDS registration").
+		Param(ws.PathParameter(RouteConfigName, "route configuration name").DataType("string")).
+		Param(ws.PathParameter(ServiceCluster, "client proxy service cluster").DataType("string")).
+		Param(ws.PathParameter(ServiceNode, "client proxy service node").DataType("string")))
+	ws.Route(ws.
+		GET(fmt.Sprintf("/v1/addroutes/{%s}/{%s}/{%s}", RouteConfigName, ServiceCluster, ServiceNode)).
+		To(ds.AddRoutes).
+		Doc("CDS inject routes").
+		Param(ws.PathParameter(RouteConfigName, "route configuration name").DataType("string")).
+		Param(ws.PathParameter(ServiceCluster, "client proxy service cluster").DataType("string")).
+		Param(ws.PathParameter(ServiceNode, "client proxy service node").DataType("string")))
+	ws.Route(ws.
+		GET(fmt.Sprintf("/v1/deleteroutes/{%s}/{%s}/{%s}", RouteConfigName, ServiceCluster, ServiceNode)).
+		To(ds.DeleteRoutes).
+		Doc("CDS delete routes").
 		Param(ws.PathParameter(RouteConfigName, "route configuration name").DataType("string")).
 		Param(ws.PathParameter(ServiceCluster, "client proxy service cluster").DataType("string")).
 		Param(ws.PathParameter(ServiceNode, "client proxy service node").DataType("string")))
@@ -277,10 +326,40 @@ func (ds *DiscoveryService) Register(container *restful.Container) {
 		Doc("LDS registration").
 		Param(ws.PathParameter(ServiceCluster, "client proxy service cluster").DataType("string")).
 		Param(ws.PathParameter(ServiceNode, "client proxy service node").DataType("string")))
+	ws.Route(ws.
+		GET(fmt.Sprintf("/v1/addlisteners/{%s}/{%s}", ServiceCluster, ServiceNode)).
+		To(ds.AddListeners).
+		Doc("CDS inject listeners").
+		Param(ws.PathParameter(ServiceCluster, "client proxy service cluster").DataType("string")).
+		Param(ws.PathParameter(ServiceNode, "client proxy service node").DataType("string")))
+	ws.Route(ws.
+		GET(fmt.Sprintf("/v1/deletelisteners/{%s}/{%s}", ServiceCluster, ServiceNode)).
+		To(ds.DeleteListeners).
+		Doc("CDS delete listeners").
+		Param(ws.PathParameter(ServiceCluster, "client proxy service cluster").DataType("string")).
+		Param(ws.PathParameter(ServiceNode, "client proxy service node").DataType("string")))
 
 	ws.Route(ws.
 		GET("/cache_stats").
 		To(ds.GetCacheStats).
+		Doc("Get discovery service cache stats").
+		Writes(discoveryCacheStats{}))
+
+	ws.Route(ws.
+		GET("/lds_stats").
+		To(ds.GetLdsStats).
+		Doc("Get discovery service cache stats").
+		Writes(discoveryCacheStats{}))
+
+	ws.Route(ws.
+		GET("/rds_stats").
+		To(ds.GetRdsStats).
+		Doc("Get discovery service cache stats").
+		Writes(discoveryCacheStats{}))
+
+	ws.Route(ws.
+		GET("/cds_stats").
+		To(ds.GetCdsStats).
 		Doc("Get discovery service cache stats").
 		Writes(discoveryCacheStats{}))
 
@@ -294,7 +373,7 @@ func (ds *DiscoveryService) Register(container *restful.Container) {
 
 // Run starts the server and blocks
 func (ds *DiscoveryService) Run() {
-	glog.Infof("Starting discovery service at %v", ds.server.Addr)
+	glog.Warningf("Starting discovery service at %v", ds.server.Addr)
 	if err := ds.server.ListenAndServe(); err != nil {
 		glog.Warning(err)
 	}
@@ -306,14 +385,60 @@ func (ds *DiscoveryService) GetCacheStats(_ *restful.Request, response *restful.
 	for k, v := range ds.sdsCache.stats() {
 		stats[k] = v
 	}
-	for k, v := range ds.cdsCache.stats() {
-		stats[k] = v
-	}
 	for k, v := range ds.rdsCache.stats() {
 		stats[k] = v
 	}
 	for k, v := range ds.ldsCache.stats() {
 		stats[k] = v
+	}
+	for k, v := range ds.hijackCdsCache.stats() {
+		stats["hijacking-cds: "+k] = v
+	}
+	for k, v := range ds.hijackLdsCache.stats() {
+		stats["hijacking-lds: "+k] = v
+	}
+	for k, v := range ds.hijackRdsCache.stats() {
+		stats["hijacking-rds: "+k] = v
+	}
+	if err := response.WriteEntity(discoveryCacheStats{stats}); err != nil {
+		glog.Warning(err)
+	}
+}
+
+// GetCacheStats returns the statistics for cached discovery responses.
+func (ds *DiscoveryService) GetLdsStats(_ *restful.Request, response *restful.Response) {
+	stats := make(map[string]*discoveryCacheStatEntry)
+	for k, v := range ds.ldsCache.stats() {
+		stats[k] = v
+	}
+	for k, v := range ds.hijackLdsCache.stats() {
+		stats["hijacking-lds: "+k] = v
+	}
+	if err := response.WriteEntity(discoveryCacheStats{stats}); err != nil {
+		glog.Warning(err)
+	}
+}
+
+func (ds *DiscoveryService) GetRdsStats(_ *restful.Request, response *restful.Response) {
+	stats := make(map[string]*discoveryCacheStatEntry)
+	for k, v := range ds.rdsCache.stats() {
+		stats[k] = v
+	}
+	for k, v := range ds.hijackRdsCache.stats() {
+		stats["hijacking-rds: "+k] = v
+	}
+	if err := response.WriteEntity(discoveryCacheStats{stats}); err != nil {
+		glog.Warning(err)
+	}
+}
+
+func (ds *DiscoveryService) GetCdsStats(_ *restful.Request, response *restful.Response) {
+	stats := make(map[string]*discoveryCacheStatEntry)
+	for k, v := range ds.cdsCache.stats() {
+		stats[k] = v
+	}
+	for k, v := range ds.hijackCdsCache.stats() {
+		stats["hijacking-cds: "+k] = v
 	}
 	if err := response.WriteEntity(discoveryCacheStats{stats}); err != nil {
 		glog.Warning(err)
@@ -408,14 +533,18 @@ func (ds *DiscoveryService) parseDiscoveryRequest(request *restful.Request) (pro
 // ListClusters responds to CDS requests for all outbound clusters
 func (ds *DiscoveryService) ListClusters(request *restful.Request, response *restful.Response) {
 	key := request.Request.URL.String()
-	out, cached := ds.cdsCache.cachedDiscoveryResponse(key)
+	out, cached := ds.hijackCdsCache.cachedDiscoveryResponse(key)
+	if cached {
+		glog.V(2).Infof("Hit hijack CSD cache for  %s\n", key)
+	} else {
+		out, cached = ds.cdsCache.cachedDiscoveryResponse(key)
+	}
 	if !cached {
 		role, err := ds.parseDiscoveryRequest(request)
 		if err != nil {
 			errorResponse(response, http.StatusNotFound, "CDS "+err.Error())
 			return
 		}
-
 		clusters := buildClusters(ds.Environment, role)
 		if out, err = json.MarshalIndent(ClusterManager{Clusters: clusters}, " ", " "); err != nil {
 			errorResponse(response, http.StatusInternalServerError, "CDS "+err.Error())
@@ -426,10 +555,41 @@ func (ds *DiscoveryService) ListClusters(request *restful.Request, response *res
 	writeResponse(response, out)
 }
 
+// DONOTSUBMIT: hack to insert a clusters config
+func (ds *DiscoveryService) AddClusters(request *restful.Request, response *restful.Response) {
+	key := strings.Replace(request.Request.URL.Path, "addclusters", "clusters", 1)
+	data, err := base64.StdEncoding.DecodeString(request.Request.FormValue("data"))
+	if err != nil {
+		errorResponse(response, http.StatusInternalServerError, "Cannot parse data "+err.Error())
+		return
+	}
+	glog.V(2).Infof("Injecting cluster for %s\n", key)
+	ds.hijackCdsCache.updateCachedDiscoveryResponse(key, data)
+
+	writeResponse(response, data)
+}
+
+func (ds *DiscoveryService) DeleteClusters(request *restful.Request, response *restful.Response) {
+	key := strings.Replace(request.Request.URL.Path, "deleteclusters", "clusters", 1)
+	glog.V(2).Infof("Delete cluster for %s\n", key)
+	ds.hijackCdsCache.removeCachedDiscoveryResponse(key)
+	if request.Request.FormValue("reset") == "hard" {
+		ds.cdsCache.removeCachedDiscoveryResponse(key)
+	}
+
+	writeResponse(response, []byte("cluster "+key+" deleted"))
+}
+
 // ListListeners responds to LDS requests
 func (ds *DiscoveryService) ListListeners(request *restful.Request, response *restful.Response) {
 	key := request.Request.URL.String()
-	out, cached := ds.ldsCache.cachedDiscoveryResponse(key)
+	out, cached := ds.hijackLdsCache.cachedDiscoveryResponse(key)
+	if cached {
+		glog.V(2).Infof("Hit hijack LDS cache for %s\n", key)
+	} else {
+		out, cached = ds.ldsCache.cachedDiscoveryResponse(key)
+	}
+
 	if !cached {
 		role, err := ds.parseDiscoveryRequest(request)
 		if err != nil {
@@ -448,12 +608,39 @@ func (ds *DiscoveryService) ListListeners(request *restful.Request, response *re
 	writeResponse(response, out)
 }
 
+func (ds *DiscoveryService) AddListeners(request *restful.Request, response *restful.Response) {
+	key := strings.Replace(request.Request.URL.Path, "addlisteners", "listeners", 1)
+	data, err := base64.StdEncoding.DecodeString(request.Request.FormValue("data"))
+	if err != nil {
+		errorResponse(response, http.StatusInternalServerError, "Cannot parse data "+err.Error())
+		return
+	}
+	glog.V(2).Infof("Injecting listeners for %s\n", key)
+	ds.hijackLdsCache.updateCachedDiscoveryResponse(key, data)
+	writeResponse(response, data)
+}
+
+func (ds *DiscoveryService) DeleteListeners(request *restful.Request, response *restful.Response) {
+	key := strings.Replace(request.Request.URL.Path, "deletelisteners", "listeners", 1)
+	glog.V(2).Infof("Delete listeners for %s\n", key)
+	ds.hijackLdsCache.removeCachedDiscoveryResponse(key)
+	if request.Request.FormValue("reset") == "hard" {
+		ds.ldsCache.removeCachedDiscoveryResponse(key)
+	}
+	writeResponse(response, []byte("listeners "+key+" deleted"))
+}
+
 // ListRoutes responds to RDS requests, used by HTTP routes
 // Routes correspond to HTTP routes and use the listener port as the route name
 // to identify HTTP filters in the config. Service node value holds the local proxy identity.
 func (ds *DiscoveryService) ListRoutes(request *restful.Request, response *restful.Response) {
 	key := request.Request.URL.String()
-	out, cached := ds.rdsCache.cachedDiscoveryResponse(key)
+	out, cached := ds.hijackRdsCache.cachedDiscoveryResponse(key)
+	if cached {
+		glog.V(2).Infof("Hit hijack RDS cache for %s\n", key)
+	} else {
+		out, cached = ds.rdsCache.cachedDiscoveryResponse(key)
+	}
 	if !cached {
 		role, err := ds.parseDiscoveryRequest(request)
 		if err != nil {
@@ -470,6 +657,28 @@ func (ds *DiscoveryService) ListRoutes(request *restful.Request, response *restf
 		ds.rdsCache.updateCachedDiscoveryResponse(key, out)
 	}
 	writeResponse(response, out)
+}
+
+func (ds *DiscoveryService) AddRoutes(request *restful.Request, response *restful.Response) {
+	key := strings.Replace(request.Request.URL.Path, "addroutes", "routes", 1)
+	data, err := base64.StdEncoding.DecodeString(request.Request.FormValue("data"))
+	if err != nil {
+		errorResponse(response, http.StatusInternalServerError, "Cannot parse data "+err.Error())
+		return
+	}
+	glog.V(2).Infof("Injecting RSD for %s\n", key)
+	ds.hijackRdsCache.updateCachedDiscoveryResponse(key, data)
+	writeResponse(response, data)
+}
+
+func (ds *DiscoveryService) DeleteRoutes(request *restful.Request, response *restful.Response) {
+	key := strings.Replace(request.Request.URL.Path, "deleteroutes", "routes", 1)
+	glog.V(2).Infof("Delete routes for %s\n", key)
+	ds.hijackRdsCache.removeCachedDiscoveryResponse(key)
+	if request.Request.FormValue("reset") == "hard" {
+		ds.rdsCache.removeCachedDiscoveryResponse(key)
+	}
+	writeResponse(response, []byte("routes "+key+" deleted"))
 }
 
 func errorResponse(r *restful.Response, status int, msg string) {
